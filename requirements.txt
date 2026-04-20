@@ -1,0 +1,66 @@
+# ══════════════════════════════════════════════════════
+# MeetAI — Complete Requirements
+# Install: pip install -r requirements.txt
+# ══════════════════════════════════════════════════════
+
+# ── API Server ────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+python-multipart>=0.0.9      # for file uploads
+
+# ── UI (stealth overlay) ──────────────────────────────
+PyQt6>=6.6.0
+# PySide6>=6.6.0             # alternative to PyQt6
+
+# macOS only (pyobjc for NSWindow.sharingType)
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+
+# ── Audio capture ─────────────────────────────────────
+sounddevice>=0.4.6            # mic capture (cross-platform)
+PyAudioWPatch>=0.2.12; sys_platform == "win32"  # WASAPI loopback (Windows)
+SpeechRecognition>=3.10.0     # fallback transcription via Google Web Speech
+
+# ── Voice Activity Detection ──────────────────────────
+# silero-vad pulls torch automatically
+torch>=2.0.0                  # for Silero VAD
+silero-vad>=5.1.0             # primary VAD (< 1ms per 30ms chunk)
+webrtcvad-wheels>=2.0.14      # fallback VAD (pip install webrtcvad-wheels on Windows)
+
+# ── Local Transcription ───────────────────────────────
+faster-whisper>=1.0.0         # 4× faster than openai-whisper, int8 quant
+# Alternative cloud transcription (uncomment one):
+# deepgram-sdk>=3.0.0
+# assemblyai>=0.30.0
+
+# ── LLM integration (switchable via LiteLLM) ──────────
+litellm>=1.50.0               # unified interface: Claude, GPT-4, Gemini, Ollama
+anthropic>=0.40.0
+openai>=1.50.0
+
+# ── RAG vector store ──────────────────────────────────
+chromadb>=0.6.0
+sentence-transformers>=3.0.0  # all-MiniLM-L6-v2 (80 MB, CPU)
+
+# ── Document loading ──────────────────────────────────
+pypdf>=4.0.0                  # PDF parsing
+python-docx>=1.0.0            # DOCX reading/writing
+docx2txt>=0.8                 # DOCX text extraction fallback
+
+# ── Export ────────────────────────────────────────────
+fpdf2>=2.8.0                  # PDF generation (no system deps)
+
+# ── Screenshot / Vision ───────────────────────────────
+Pillow>=10.0.0                # ImageGrab.grab() for screenshots
+mss>=9.0.0                    # fallback multi-screen capture
+
+# ── Process disguise / Hotkeys ────────────────────────
+pynput>=1.7.6                 # global keyboard hotkeys
+setproctitle>=1.3.3           # rename process in task manager
+
+# ── Packaging (optional, for distribution) ────────────
+# pyinstaller>=6.0.0
+
+# ── Utilities ─────────────────────────────────────────
+numpy>=1.24.0
+python-dotenv>=1.0.0          # .env file loading
