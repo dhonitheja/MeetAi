@@ -1,158 +1,77 @@
-# ◈ MeetAI — Invisible AI Co-pilot for Every Call
+# MeetAI: The Stealth AI Meeting Assistant 🎭🤖
 
-> **Zero typing. Zero clicking. Real-time AI suggestions while you're live.**  
-> Invisible to OBS, Zoom, Teams, Meet, and browser screen sharing.
-
----
-
-## What it does (like Cluely / Cheating Daddy)
-
-| Feature | Detail |
-|---------|--------|
-| 🛡️ **Invisible to screen share** | `WDA_EXCLUDEFROMCAPTURE` (Windows DWM level) — defeats OBS, Zoom, Teams, Chrome |
-| 🎤 **Dual audio capture** | WASAPI loopback for system audio + sounddevice for mic — no virtual devices |
-| 🤫 **Zero interaction** | AI suggestions trigger automatically when they stop talking |
-| 📸 **Screenshot + Vision** | Press F11 → AI reads your screen (code, questions, slides) |
-| 🧠 **Local-first** | Whisper (CPU int8), Silero VAD, ChromaDB — all on-device, nothing in the cloud |
-| 📄 **Document RAG** | Upload your resume/CV/docs → AI answers using your actual experience |
-| 📝 **Rolling summary** | Auto-generates meeting notes, action items, and decisions |
-| 🔑 **Global hotkeys** | F9 hide/show, F10 copy answer, F11 screenshot, Ctrl+Shift+M click-through |
-| 🖥️ **Process disguise** | Shows as "Windows Audio Device Graph" in Task Manager |
+**Unseen. Untraceable. Unstoppable.**
+MeetAI is a production-grade, zero-interaction SaaS meeting assistant that integrates real-time voice cloning, face swapping, and RAG-driven co-pilot suggestions into one stealthy, screen-exclusion overlay.
 
 ---
 
-## Quick Start (5 minutes)
+## 🚀 Key Features
 
-### 1. Install Python dependencies
+- **🎭 Real-Time Voice Cloning:** Powered by VoxCPM2, switch your identity instantly with 48kHz high-fidelity output via a virtual microphone.
+- **👤 Live Face Swapping:** Leverage InsightFace for seamless, low-latency face cloning on any video stream using OBS Virtual Camera.
+- **🤖 RAG Co-Pilot:** Real-time Whisper transcription feeding into LangChain and ChromaDB to surface document-grounded suggestions and action items.
+- **📞 Recall.ai Meeting Bot:** An automated bot that joins Zoom, Teams, or Google Meet to provide real-time diarized transcripts directly to your dashboard.
+- **👻 Stealth Overlay:** A specialized Electron shell using `SetWindowDisplayAffinity` to remain completely invisible to screen-sharing and recording software.
 
+---
+
+## 💻 Hardware Requirements
+
+To ensure smooth 24+ FPS face swapping and <200ms voice synthesis latency, the following is required:
+
+| Component | Minimum | Recommended |
+| :--- | :--- | :--- |
+| **GPU** | NVIDIA RTX 2060 (6GB VRAM) | NVIDIA RTX 3070 (8GB VRAM) |
+| **OS** | Windows 10 v2004+ / macOS 12+ | Windows 11 / macOS 14+ |
+| **RAM** | 16GB | 32GB+ |
+| **Driver** | CUDA 11.8+ (for Windows) | Latest Apple Silicon (M2+) |
+
+---
+
+## 🛠️ Setup & Installation
+
+### 1. External Dependencies
+- **Virtual Audio:** Install [VB-Audio Cable](https://vb-audio.com/Cable/) (Windows) or [BlackHole](https://existential.audio/blackhole/) (macOS).
+- **Virtual Camera:** Install [OBS Studio](https://obsproject.com/) and enable the **Virtual Camera** feature.
+
+### 2. Model Downloads
+You must manually place the following model weights in `./models/`:
+- **VoxCPM2:** Download from [HuggingFace (openbmb/VoxCPM2)](https://huggingface.co/openbmb/VoxCPM2).
+- **InsightFace:** Download `inswapper_128.onnx` from [HuggingFace (deepinsight/inswapper)](https://huggingface.co/deepinsight/inswapper).
+
+### 3. Quick Start
 ```bash
-pip install -r requirements.txt
-```
+# 1. Clone the repository
+git clone https://github.com/dhonitheja/MeetAi.git
+cd MeetAi
 
-### 2. Copy and configure `.env`
-
-```bash
+# 2. Configure Environment
 cp .env.example .env
-# Edit .env — add ANTHROPIC_API_KEY or OPENAI_API_KEY
-```
+# Edit .env with your Stripe, Recall, and LLM API keys
 
-### 3. Launch everything
+# 3. Install Python Sidecar
+pip install -r requirements.txt
 
-```bash
-python start.py
-```
-
-This starts:
-- **FastAPI backend** at `http://127.0.0.1:8765`
-- **PyQt6 stealth overlay** (invisible to screen capture)
-- **Audio engine** (mic + system audio capture)
-
-### 4. Open the web dashboard (optional)
-
-```bash
+# 4. Install Frontend & Build
 npm install
-npm run dev
-# → http://localhost:5174
+npm run build
+
+# 5. Launch (Multi-process)
+# Tab 1: ML Backend
+python start.py
+# Tab 2: Electron Desktop App
+npm start
 ```
 
 ---
 
-## Hotkeys (global — work even when overlay is hidden)
-
-| Key | Action |
-|-----|--------|
-| `F9` | Toggle overlay visibility |
-| `F10` | Copy top AI suggestion to clipboard |
-| `F11` | Screenshot + Vision AI analysis |
-| `Ctrl+Shift+M` | Toggle click-through mode |
+## 📚 Documentation
+- [Architecture & Data Flow](ARCHITECTURE.md)
+- [API Reference](API.md)
+- [Security & Privacy Standards](SECURITY.md)
+- [Release Changelog](CHANGELOG.md)
 
 ---
 
-## How it works in a real call
-
-1. **Open your meeting** in Zoom/Teams/Meet (any tab or app)
-2. **Launch MeetAI**: `python start.py`
-3. The overlay appears — **drag it to a corner** of your screen
-4. Start your call — MeetAI listens to **both sides** automatically:
-   - Your mic → transcribed as **You**
-   - Meeting audio → transcribed as **Them** via WASAPI loopback
-5. When **they stop talking**, MeetAI auto-generates suggestions
-6. Press **F10 to copy** the best answer to clipboard
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                 STEALTH OVERLAY                  │
-│   PyQt6  •  WDA_EXCLUDEFROMCAPTURE  •  Hotkeys  │
-│   Tabs: Suggestions / Transcript / Notes / Settings │
-└───────────────┬─────────────────────────────────┘
-                │ REST + SSE
-┌───────────────▼─────────────────────────────────┐
-│              FASTAPI BACKEND  :8765              │
-│  /meeting/ask   → LiteLLM (Claude/GPT/Ollama)   │
-│  /rag/upload    → ChromaDB + sentence-transformers│
-│  /screenshot/analyze → Vision AI (GPT-4V/Claude)│
-│  /meeting/export → MD / PDF / DOCX              │
-└───────────────┬─────────────────────────────────┘
-                │
-┌───────────────▼─────────────────────────────────┐
-│            AUDIO ENGINE                         │
-│  Mic: sounddevice → Silero VAD → faster-whisper │
-│  Sys: WASAPI loopback → Silero VAD → whisper    │
-└─────────────────────────────────────────────────┘
-```
-
----
-
-## Stealth: Why it works
-
-On Windows 10/11 (build 19041+):
-- `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` runs at the **DWM compositor level**
-- The window literally doesn't exist in the captured framebuffer
-- OBS, Zoom, Teams, Chrome screen share — **all defeated** without any workaround
-
-On macOS ≤ 14:
-- `NSWindow.sharingType = NSWindowSharingNone` blocks legacy CoreGraphics capture
-- Chrome/browser sharing, Teams, older Zoom: ✅ invisible
-- macOS 15 Sequoia broke this with ScreenCaptureKit — use browser-based meetings
-
----
-
-## Document RAG (upload your CV/notes)
-
-```bash
-# Via web dashboard → Documents tab
-# Or via API:
-curl -X POST http://127.0.0.1:8765/rag/upload \
-  -F "file=@/path/to/your-cv.pdf"
-```
-
-The AI will now answer questions using your actual experience, projects, and background.
-
----
-
-## Build standalone binary
-
-```bash
-pip install pyinstaller
-pyinstaller packaging/meetai.spec
-# Output: dist/MeetAI/MeetAI.exe
-```
-
----
-
-## Requirements
-
-- **Python 3.11+**
-- **Windows 10 build 19041+** (for bulletproof stealth)
-- **Chrome/Edge** (for browser dashboard)
-- **API key**: Anthropic, OpenAI, or local Ollama
-
----
-
-## License
-
-MIT — Fork freely. Star if it helps. 🌟
+## ⚖️ License
+Proprietary. All rights reserved. For commercial licensing, contact [dhonitheja@example.com].

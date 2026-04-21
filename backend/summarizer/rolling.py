@@ -27,45 +27,71 @@ except ImportError:
 
 try:
     import openai as _openai_sdk
-    HAS_LLM = True
+    HAS_OPENAI = True
 except ImportError:
-    HAS_LLM = False
+    HAS_OPENAI = False
+
+try:
+    import anthropic as _ant
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+HAS_LLM = HAS_OPENAI or HAS_ANTHROPIC or HAS_GEMINI
 
 BUFFER_WORDS = 500          # ~2-3 minutes of speech
 MAX_SUMMARY_TOKENS = 600
 
-_ollama_base  = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
 _ollama_model = os.environ.get("OLLAMA_MODEL", "gemma3:1b")
 
 MODEL_MAP = {
-    "claude":  "claude-sonnet-4-6",
+    "claude":  "claude-3-5-sonnet-20241022",
     "gpt4":    "gpt-4o",
-    "gemini":  "gemini-2.0-flash",
+    "gemini":  "gemini-2.0-flash-exp",
     "ollama":  _ollama_model,
 }
 
 
 def _llm_complete(model_key: str, prompt: str, max_tokens: int) -> str:
     """Route a completion request to the right provider."""
-    model_name = MODEL_MAP.get(model_key, _ollama_model)
+    if not HAS_LLM:
+        raise RuntimeError("No LLM SDKs installed")
+
+    model_name = MODEL_MAP.get(model_key, MODEL_MAP["ollama"])
+
+    # 1. Google Gemini
+    if model_key == "gemini":
+        if not HAS_GEMINI: raise RuntimeError("google-generativeai not installed")
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
+        return resp.text
+
+    # 2. Anthropic Claude
+    if model_key == "claude":
+        if not HAS_ANTHROPIC: raise RuntimeError("anthropic not installed")
+        client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        resp = client.messages.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return resp.content[0].text
+
+    # 3. OpenAI or Ollama
+    if not HAS_OPENAI: raise RuntimeError("openai not installed")
     if model_key == "ollama":
-        client = _openai_sdk.OpenAI(base_url=f"{_ollama_base}/v1", api_key="ollama")
-    elif model_key == "gpt4":
-        client = _openai_sdk.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-    elif model_key == "claude":
-        try:
-            import anthropic as _ant
-            c = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-            resp = c.messages.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-            )
-            return resp.content[0].text
-        except ImportError:
-            raise RuntimeError("anthropic package not installed")
+        base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+        client = _openai_sdk.OpenAI(base_url=f"{base}/v1", api_key="ollama")
     else:
-        client = _openai_sdk.OpenAI(base_url=f"{_ollama_base}/v1", api_key="ollama")
+        client = _openai_sdk.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
     resp = client.chat.completions.create(
         model=model_name,

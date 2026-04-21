@@ -18,6 +18,9 @@ type View = 'landing' | 'auth' | 'dashboard' | 'meeting' | 'notes' | 'settings' 
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
 export default function App() {
+  const isOverlay = (window as any).shortcuts?.isOverlay;
+  const [latestTranscript, setLatestTranscript] = useState('');
+
   const [user, setUser]   = useState<AuthUser | null>(getUser);
   const [view, setView]   = useState<View>(user ? 'dashboard' : 'landing');
   const [toast, setToast] = useState('');
@@ -50,7 +53,7 @@ export default function App() {
       {(view !== 'landing' && view !== 'auth') && (
         <AppShell user={user!} view={view} setView={setView} health={health} onSignOut={handleSignOut} showToast={showToast}>
           {view === 'dashboard' && <DashboardScreen user={user!} setView={setView} />}
-          {view === 'meeting'   && <MeetingRoom settings={getSettings()} health={health} showToast={showToast} onEnd={({ id, dur, sugg, title }) => { saveMeeting({ id, title, date: 'Just now', duration: dur, model: getSettings().model, suggestions: sugg }); setView('notes'); }} />}
+          {view === 'meeting'   && <MeetingRoom settings={getSettings()} health={health} showToast={showToast} onEnd={({ id, dur, sugg, title }) => { saveMeeting({ id, title, date: new Date().toLocaleDateString('en', { month: 'short', day: 'numeric' }) + ', ' + new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }), duration: dur, model: getSettings().model, suggestions: sugg }); setView('notes'); }} />}
           {view === 'notes'     && <NotesScreen meetings={getPastMeetings()} showToast={showToast} />}
           {view === 'settings'  && <SettingsScreen showToast={showToast} />}
           {view === 'docs'      && <DocsScreen showToast={showToast} />}
@@ -437,6 +440,9 @@ function MeetingRoom({ settings, health, showToast, onEnd }: MeetingRoomProps) {
     setStreaming('');
 
     // If backend online — stream first suggestion
+    const jt = (settings as any).jobTitle ?? '';
+    const co = (settings as any).company ?? '';
+
     if (health.online) {
       let buffer = '';
       stopStreamRef.current = streamSuggestion(
@@ -445,16 +451,18 @@ function MeetingRoom({ settings, health, showToast, onEnd }: MeetingRoomProps) {
         async () => {
           setStreaming('');
           setIsThinking(false);
-          // Get full ranked suggestions
-          const suggs = await getSuggestions(utterance, sessionId, settings.model, settings.contextPrompt);
+          const suggs = await getSuggestions(
+            utterance, sessionId, settings.model, settings.contextPrompt, jt, co
+          );
           setSuggestions(suggs);
           setSuggCount(c => c + suggs.length);
         },
       );
     } else {
-      // Demo mode
-      await new Promise(r => setTimeout(r, 600));
-      const suggs = await getSuggestions(utterance, sessionId, settings.model, settings.contextPrompt);
+      await new Promise(r => setTimeout(r, 500));
+      const suggs = await getSuggestions(
+        utterance, sessionId, settings.model, settings.contextPrompt, jt, co
+      );
       setSuggestions(suggs);
       setSuggCount(c => c + suggs.length);
       setIsThinking(false);
@@ -471,7 +479,12 @@ function MeetingRoom({ settings, health, showToast, onEnd }: MeetingRoomProps) {
 
     const id = `mtg_${Date.now()}`;
     setSessionId(id);
-    await startMeeting(settings.model, settings.contextPrompt);
+    await startMeeting(
+      settings.model,
+      settings.contextPrompt,
+      (settings as any).jobTitle ?? '',
+      (settings as any).company ?? '',
+    );
 
     const listener = new AutoListener({
       onTranscript: (ev) => {
@@ -517,11 +530,14 @@ function MeetingRoom({ settings, health, showToast, onEnd }: MeetingRoomProps) {
     listenerRef.current?.stop();
     stopStreamRef.current?.();
     if (timerRef.current) clearInterval(timerRef.current);
+    if (waveRef.current) clearInterval(waveRef.current);
     const dur = fmtTime(elapsed);
-    const { summary } = await endMeeting(sessionId).catch(() => ({ summary: '', actions: [] }));
+    // endMeeting is session-scoped on the backend — no ID argument needed
+    const { summary } = await endMeeting('').catch(() => ({ summary: '', actions: [] }));
     if (summary) localStorage.setItem('meetai_last_summary', summary);
     localStorage.setItem('meetai_last_transcript', JSON.stringify(transcript));
-    onEnd({ id: sessionId, dur, sugg: suggCount, title: 'Meeting · ' + new Date().toLocaleDateString() });
+    const dateStr = new Date().toLocaleDateString('en', { month: 'short', day: 'numeric' });
+    onEnd({ id: sessionId, dur, sugg: suggCount, title: `Meeting · ${dateStr}` });
   };
 
   const copySuggestion = (text: string) => {
@@ -743,10 +759,10 @@ function SettingsScreen({ showToast }: { showToast: (m: string) => void }) {
   const update = (patch: Partial<AppSettings>) => { const n = { ...s, ...patch }; setS(n); saveSettings(n); };
 
   const MODELS = [
-    { id: 'claude', label: 'Claude Sonnet', desc: 'Best for nuanced, human-like answers' },
-    { id: 'gpt-4', label: 'GPT-4o', desc: 'Broad knowledge, very fast' },
-    { id: 'gemini', label: 'Gemini 1.5', desc: 'Great for technical and coding topics' },
-    { id: 'ollama', label: 'Ollama (local)', desc: 'Free, 100% private, no API key' },
+    { id: 'ollama', label: 'Ollama (local)', desc: 'Free, 100% private — requires Ollama running locally' },
+    { id: 'claude', label: 'Claude Sonnet', desc: 'Best for nuanced, human-like answers (requires Anthropic API key)' },
+    { id: 'gpt4', label: 'GPT-4o', desc: 'Broad knowledge, very fast (requires OpenAI key)' },
+    { id: 'gemini', label: 'Gemini Flash', desc: 'Great for speed and coding topics (requires Gemini key)' },
   ];
 
   return (
@@ -754,12 +770,30 @@ function SettingsScreen({ showToast }: { showToast: (m: string) => void }) {
       <div className="section-label">SETTINGS</div>
       <h2 style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 22, marginBottom: 28 }}>Preferences</h2>
 
+      {/* Job context */}
+      <div style={{ marginBottom: 24, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Job title</div>
+          <input className="form-input" placeholder="e.g. Senior Software Engineer"
+            value={(s as any).jobTitle ?? ''}
+            onChange={e => update({ jobTitle: e.target.value } as any)}
+          />
+        </div>
+        <div>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Company / interviewer</div>
+          <input className="form-input" placeholder="e.g. Google, Stripe, Acme Corp"
+            value={(s as any).company ?? ''}
+            onChange={e => update({ company: e.target.value } as any)}
+          />
+        </div>
+      </div>
+
       {/* Context prompt */}
       <div style={{ marginBottom: 28 }}>
-        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Your context prompt</div>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 }}>Tell the AI who you are and what the meeting is about. The more specific, the better the suggestions.</div>
-        <textarea className="textarea-field" rows={5}
-          placeholder={"Example: I'm interviewing for a Staff Engineer role at Acme Corp. My background is Python, distributed systems, and AWS. I have 8 years experience. Keep answers concise and confident."}
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Your background context</div>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 }}>Paste your resume summary, skills, and experience. The AI will answer AS you — grounding every suggestion in your actual background.</div>
+        <textarea className="textarea-field" rows={6}
+          placeholder="Example: 8 years as a backend engineer specializing in Python and Go. Led migration of monolith to microservices at StartupX, reducing p99 latency from 800ms to 45ms. Core skills: distributed systems, Kafka, Kubernetes, PostgreSQL, AWS."
           value={s.contextPrompt}
           onChange={e => update({ contextPrompt: e.target.value })}
         />
@@ -784,8 +818,9 @@ function SettingsScreen({ showToast }: { showToast: (m: string) => void }) {
       {/* API Key */}
       <div style={{ marginBottom: 28 }}>
         <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>API Key</div>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 }}>Optional — for Claude/GPT-4/Gemini. Stored locally, never sent to our servers.</div>
-        <input className="form-input" type="password" placeholder="sk-ant-... or sk-..." value={s.apiKey} onChange={e => update({ apiKey: e.target.value })} />
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 }}>Optional — for Claude/GPT-4/Gemini. Stored locally in your browser, never transmitted to our servers. Leave blank for Ollama (local).</div>
+        <input className="form-input" type="password" placeholder="sk-ant-... or sk-... or AIza..." value={s.apiKey} onChange={e => update({ apiKey: e.target.value })} />
+        {s.apiKey && <div style={{ fontSize: 11, color: 'var(--success)', marginTop: 6 }}>✓ API key saved locally</div>}
       </div>
 
       {/* Silence threshold */}

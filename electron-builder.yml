@@ -1,0 +1,77 @@
+# MeetAI - electron-builder configuration
+# Windows NSIS installer with Python sidecar bundling
+
+appId: com.meetai.desktop
+productName: MeetAI
+copyright: "Copyright 2026 Sai Teja Ragula"
+
+# Build output
+directories:
+  output: dist/electron
+  buildResources: build
+
+# Files to include in the app bundle
+files:
+  - "electron/**/*"
+  - "!electron/renderer/src/**"
+  - "node_modules/**/*"
+  - "package.json"
+
+# Extra resources bundled alongside the app
+# Python sidecar must be built first: pyinstaller server.spec
+extraResources:
+  - from: "dist/server/"
+    to: "server"
+    filter:
+      - "**/*"
+  - from: "models/"
+    to: "models"
+    filter:
+      - "**/*.onnx"
+      - "**/buffalo_l/**"
+
+# Windows-specific config
+win:
+  sign: ${WIN_CSC_LINK}  # build fails if not set
+  certificatePassword: ${WIN_CSC_KEY_PASSWORD}
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+
+# NSIS installer configuration
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/installer.ico
+  uninstallerIcon: build/uninstaller.ico
+  installerHeader: build/header.bmp
+  license: build/LICENSE.txt
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  runAfterFinish: true
+
+  # Custom NSIS script for virtual driver checks and clean uninstall
+  include: build/installer.nsh
+
+# macOS (future)
+mac:
+  target:
+    - dmg
+  category: public.app-category.productivity
+  icon: build/icon.icns
+  # hardenedRuntime: true
+  # gatekeeperAssess: false
+  # entitlements: build/entitlements.mac.plist
+
+# Auto-updater publish config (GitHub Releases)
+# electron-builder reads this for auto-updater feed
+publish:
+  provider: github
+  owner: dhonitheja
+  repo: MeetAi
+  releaseType: release
+
+afterSign: "scripts/verify_signature.js"

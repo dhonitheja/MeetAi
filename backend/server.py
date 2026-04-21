@@ -4,16 +4,23 @@ Entry point for the Python AI engine.
 Run: uvicorn backend.server:app --host 127.0.0.1 --port 8765 --reload
 """
 
-import json
 import os
-import sys
+import logging
+
+from backend.logging_config import configure_logging
+
+configure_logging(log_level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+import json
+import asyncio
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-# Fix Windows cp1252 terminal encoding before any print()
+# Fix Windows cp1252 terminal encoding for console output
 import sys as _sys
 if _sys.stdout and hasattr(_sys.stdout, "reconfigure"):
     try:
@@ -29,12 +36,51 @@ try:
 except ImportError:
     pass
 
+from backend.middleware.startup_validator import (
+    validate_environment,
+    validate_stripe_keys,
+)
+
+# Fail fast before routers/engines initialize.
+validate_environment()
+validate_stripe_keys()
+
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from slowapi.errors import RateLimitExceeded
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from backend.middleware.graceful_shutdown import run_graceful_shutdown
+from backend.middleware.rate_limiter import limiter, rate_limit_exceeded_handler
+from backend.billing.subscription_gate import SubscriptionGateMiddleware
+
+# Routers
+from backend.face.face_swap_engine import FaceSwapEngine
+from backend.routers.billing import billing_router
+from backend.routers.face import face_router
+from backend.routers.meeting import meeting_router
+from backend.persona.persona_manager import PersonaManager
+from backend.routers.persona import persona_router
+from backend.rag.document_store import DocumentStore
+from backend.routers import rag as rag_module
+from backend.routers.rag import rag_router
+
+try:
+    from backend.routers.voice import load_voice_engine, voice_router
+    HAS_VOICE = True
+except Exception as exc:
+    HAS_VOICE = False
+    voice_router = None
+    _voice_import_error = str(exc)
+
+    async def load_voice_engine() -> None:
+        logger.warning("voice_router_unavailable", extra={"error": _voice_import_error})
 
 # ─── Conditional imports (graceful degradation for demo) ────────────────────
 try:
@@ -42,7 +88,7 @@ try:
     HAS_WHISPER = True
 except ImportError:
     HAS_WHISPER = False
-    print("[server] faster-whisper not installed -- transcription disabled")
+    logger.warning("whisper_unavailable")
 
 try:
     import chromadb
@@ -50,69 +96,78 @@ try:
     HAS_RAG = True
 except ImportError:
     HAS_RAG = False
-    print("[server] chromadb/sentence-transformers not installed -- RAG disabled")
+    logger.warning("rag_dependencies_unavailable")
 
 try:
     import openai as _openai_sdk
-    HAS_LLM = True
+    HAS_OPENAI = True
 except ImportError:
-    HAS_LLM = False
-    print("[server] openai package not installed -- LLM disabled")
+    HAS_OPENAI = False
 
-# ─── Model map (must be defined before _get_client / completion) ─────────────
+try:
+    import anthropic as _ant
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+HAS_LLM = HAS_OPENAI or HAS_ANTHROPIC or HAS_GEMINI
+
+# ─── Model map ─────────────────────────────────────────────────────────────
 
 _ollama_model = os.environ.get("OLLAMA_MODEL", "gemma3:1b")
 
 MODEL_MAP = {
-    "claude":  "claude-sonnet-4-6",
+    "claude":  "claude-3-5-sonnet-20241022",
     "gpt4":    "gpt-4o",
-    "gemini":  "gemini-2.0-flash",
+    "gemini":  "gemini-2.0-flash-exp",
     "ollama":  _ollama_model,
 }
 
 # ─── Unified LLM completion helper ──────────────────────────────────────────
 
-def _get_client(model_key: str):
-    """Return an openai.OpenAI client pointed at the right base URL."""
-    if model_key == "ollama":
-        base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
-        return _openai_sdk.OpenAI(base_url=f"{base}/v1", api_key="ollama")
-    if model_key == "gpt4":
-        return _openai_sdk.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-    if model_key == "claude":
-        # Use Anthropic SDK if available, else raise early
-        try:
-            import anthropic as _ant
-            return _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        except ImportError:
-            raise RuntimeError("anthropic package not installed")
-    raise ValueError(f"Unknown model key: {model_key}")
-
 def completion(model_key: str, messages: list, max_tokens: int = 600, stream: bool = False):
     """
-    Thin wrapper that routes to the right provider via the openai-compatible API.
-    Returns a response object with .choices[0].message.content (non-stream)
-    or an iterator of chunks with .choices[0].delta.content (stream).
+    Unified completion helper. Routes to the appropriate SDK.
     """
     if not HAS_LLM:
-        raise RuntimeError("openai package not installed")
+        raise RuntimeError("No LLM SDKs installed")
 
     model_name = MODEL_MAP.get(model_key, MODEL_MAP["ollama"])
-    client = _get_client(model_key)
+    
+    # 1. Google Gemini
+    if model_key == "gemini":
+        if not HAS_GEMINI: raise RuntimeError("google-generativeai not installed")
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        # Convert messages to Gemini format
+        prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+        resp = model.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
+        
+        class _Resp:
+            class _Choice:
+                class _Msg:
+                    content = resp.text
+                message = _Msg()
+            choices = [_Choice()]
+        return _Resp()
 
+    # 2. Anthropic Claude
     if model_key == "claude":
-        # Anthropic SDK has a different interface
-        import anthropic as _ant
-        assert isinstance(client, _ant.Anthropic)
+        if not HAS_ANTHROPIC: raise RuntimeError("anthropic not installed")
+        client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         system_msgs = [m["content"] for m in messages if m["role"] == "system"]
         user_msgs = [m for m in messages if m["role"] != "system"]
         resp = client.messages.create(
-            model=model_name,
-            system=system_msgs[0] if system_msgs else "",
-            messages=user_msgs,
-            max_tokens=max_tokens,
+            model=model_name, system=system_msgs[0] if system_msgs else "",
+            messages=user_msgs, max_tokens=max_tokens,
         )
-        # Wrap in openai-compatible shape
         class _Resp:
             class _Choice:
                 class _Msg:
@@ -121,16 +176,34 @@ def completion(model_key: str, messages: list, max_tokens: int = 600, stream: bo
             choices = [_Choice()]
         return _Resp()
 
-    # openai / ollama / gemini-via-openai-compat
-    if stream:
-        return client.chat.completions.create(
-            model=model_name, messages=messages,
-            max_tokens=max_tokens, stream=True,
-        )
-    resp = client.chat.completions.create(
-        model=model_name, messages=messages, max_tokens=max_tokens,
+    # 3. OpenAI or Ollama
+    if not HAS_OPENAI: raise RuntimeError("openai not installed")
+    if model_key == "ollama":
+        base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+        client = _openai_sdk.OpenAI(base_url=f"{base}/v1", api_key="ollama")
+    else:
+        client = _openai_sdk.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+    return client.chat.completions.create(
+        model=model_name, messages=messages, max_tokens=max_tokens, stream=stream
     )
-    return resp
+
+
+async def get_completion(system: str, user: str, model: str = "default") -> str:
+    """
+    Async-friendly helper used by routers that need a single text completion.
+    """
+    model_key = state.model if model == "default" else model
+    response = completion(
+        model_key=model_key,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=800,
+        stream=False,
+    )
+    return response.choices[0].message.content.strip()
 
 # ─── Global state ────────────────────────────────────────────────────────────
 
@@ -148,6 +221,16 @@ class MeetingState:
 
 state = MeetingState()
 
+# ─── Persona Pipeline ────────────────────────────────────────────────────────
+
+class PersonaPipeline:
+    def __init__(self):
+        self.manager = PersonaManager()
+        self.active_id: Optional[str] = None
+
+persona_pipeline = PersonaPipeline()
+
+
 # ─── RAG Pipeline ────────────────────────────────────────────────────────────
 
 class RAGPipeline:
@@ -159,9 +242,12 @@ class RAGPipeline:
                 self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
                 client = chromadb.PersistentClient(path=str(Path.home() / ".meetai" / "chroma_db"))
                 self.collection = client.get_or_create_collection("meeting_docs")
-                print(f"[server] RAG pipeline ready -- {self.collection.count()} chunks indexed")
+                logger.info(
+                    "rag_pipeline_ready",
+                    extra={"chunk_count": self.collection.count()},
+                )
             except Exception as e:
-                print(f"[server] RAG init failed: {e}")
+                logger.warning("rag_pipeline_init_failed", extra={"error": str(e)})
 
     def add_document(self, text: str, source: str, chunk_size: int = 1000, overlap: int = 200):
         if not self.collection or not self.embed_model:
@@ -200,9 +286,12 @@ class TranscriptionEngine:
         if HAS_WHISPER:
             try:
                 self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
-                print(f"[server] Whisper {model_size} loaded (int8 quantized)")
+                logger.info(
+                    "whisper_loaded",
+                    extra={"model_size": model_size, "compute_type": "int8"},
+                )
             except Exception as e:
-                print(f"[server] Whisper init failed: {e}")
+                logger.warning("whisper_init_failed", extra={"error": str(e)})
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         if not self.model:
@@ -374,13 +463,24 @@ def get_suggestions(last_question: str, transcript: list[dict], context: str,
     if not HAS_LLM:
         return _mock_suggestions(last_question)
 
-    rag_chunks = rag.query(last_question)
+    if rag_module._store is not None:
+        rag_results = rag_module._store.query(text=last_question, n_results=3)
+        rag_chunks = [item.get("text", "") for item in rag_results if isinstance(item, dict)]
+    else:
+        rag_chunks = rag.query(last_question)
     rag_context = "\n---\n".join(rag_chunks) if rag_chunks else "No documents uploaded."
     transcript_text = "\n".join(f"{t['speaker']}: {t['text']}" for t in transcript[-6:])
     job_title = job_title or state.job_title or "Software Engineer"
     company   = company   or state.company   or "the company"
     context   = context   or state.context_prompt or "Experienced software developer."
-    print(f"[server] context({len(context)} chars), job={job_title!r}, company={company!r}")
+    logger.debug(
+        "suggestion_context_built",
+        extra={
+            "context_chars": len(context),
+            "job_title": job_title,
+            "company": company,
+        },
+    )
 
     is_coding = (mode == "coding") or (mode == "auto" and _is_coding_question(last_question))
     prompt, max_tok = _build_prompt(
@@ -396,10 +496,13 @@ def get_suggestions(last_question: str, transcript: list[dict], context: str,
         )
         raw = response.choices[0].message.content.strip()
         if not raw:
-            print("[server] LLM returned empty response")
+            logger.warning("llm_empty_response")
             return _mock_suggestions(last_question)
 
-        print(f"[server] LLM raw ({len(raw)} chars): {raw[:120]}")
+        logger.debug(
+            "llm_raw_response",
+            extra={"char_count": len(raw), "preview": raw[:120]},
+        )
 
         # 1. Try Q:/A: format (primary — all prompts request this)
         answer_text = _extract_qa_answer(raw)
@@ -421,7 +524,7 @@ def get_suggestions(last_question: str, transcript: list[dict], context: str,
         return [{"type": "answer", "label": "Answer", "confidence": 85, "text": raw}]
 
     except Exception as e:
-        print(f"[server] LLM error: {e}")
+        logger.error("llm_completion_error", extra={"error": str(e)})
         return _mock_suggestions(last_question)
 
 
@@ -459,13 +562,112 @@ def _mock_suggestions(question: str) -> list[dict]:
 
 # ─── FastAPI App ─────────────────────────────────────────────────────────────
 
+async def _bootstrap_face_engine() -> None:
+    """Initialize shared face engine in backend.routers.face module."""
+    from backend.routers import face as face_module
+
+    if face_module._engine is not None:
+        return
+
+    face_module._engine = FaceSwapEngine()
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, face_module._engine.load)
+    except Exception as exc:
+        logger.error("face_engine_init_failed", extra={"error": str(exc)})
+
+
+async def _bootstrap_rag_store() -> None:
+    """Initialize shared DocumentStore singleton used by /rag router."""
+    if rag_module._store is not None:
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        rag_module._store = await loop.run_in_executor(None, DocumentStore)
+    except Exception as exc:
+        rag_module._store = None
+        logger.error("rag_store_init_failed", extra={"error": str(exc)})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[server] MeetAI backend starting")
+    logger.info("backend_starting")
+    try:
+        await load_voice_engine()
+    except Exception as exc:
+        logger.error("voice_engine_init_failed", extra={"error": str(exc)})
+    await _bootstrap_face_engine()
+    await _bootstrap_rag_store()
+    # Store managers in app.state for router access
+    app.state.persona_manager = persona_pipeline.manager
+    app.state.meeting_state = state
     yield
-    print("[server] MeetAI backend shutting down")
+
+    logger.info("backend_shutting_down")
 
 app = FastAPI(title="MeetAI Backend", version="1.0.0", lifespan=lifespan)
+
+
+class MockAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Sets user_id in request.state from X-User-ID header if present.
+    In a real production app, this would be a proper JWT/Session auth middleware.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        user_id = request.headers.get("X-User-ID")
+        if user_id:
+            request.state.user_id = user_id
+        return await call_next(request)
+
+
+app.add_middleware(SubscriptionGateMiddleware)
+app.add_middleware(MockAuthMiddleware)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+# Best-effort eager init so sync TestClient usage can access /rag endpoints
+# even when startup/lifespan hooks are not entered via context manager.
+if rag_module._store is None:
+    try:
+        rag_module._store = DocumentStore()
+    except Exception as exc:
+        rag_module._store = None
+        logger.error("rag_store_bootstrap_failed", extra={"error": str(exc)})
+
+
+@app.on_event("startup")
+async def load_face_engine():
+    from backend.routers import face as face_module
+    if face_module._engine is not None:
+        return
+    await _bootstrap_face_engine()
+
+
+@app.on_event("startup")
+async def load_rag_store():
+    await _bootstrap_rag_store()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await run_graceful_shutdown()
+
+
+class MaxBodySizeMiddleware(BaseHTTPMiddleware):
+    """Reject requests over 50MB at app level before route handlers fire."""
+
+    MAX_BODY = 50 * 1024 * 1024
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > self.MAX_BODY:
+            return Response("Request body too large", status_code=413)
+        return await call_next(request)
+
+
+app.add_middleware(MaxBodySizeMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -474,6 +676,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+async def health_check():
+    """Startup health check indicating feature availability."""
+    from backend.face.face_swap_engine import HAS_GFPGAN, HAS_INSIGHTFACE
+    
+    face_status = "ok" if HAS_INSIGHTFACE else "degraded"
+    face_reason = None if HAS_INSIGHTFACE else "insightface missing (requires C++ Build Tools)"
+    
+    return {
+        "status": "online",
+        "version": "1.0.0",
+        "engines": {
+            "face": {
+                "status": face_status,
+                "insightface": HAS_INSIGHTFACE,
+                "gfpgan": HAS_GFPGAN,
+                "reason": face_reason
+            },
+            "voice": "ok" if HAS_VOICE else "degraded",
+            "whisper": HAS_WHISPER,
+            "rag": HAS_RAG,
+            "llm": HAS_LLM
+        }
+    }
+
+# ─── Voice Cloning Router ───────────────────────────────────────────────────
+if voice_router is not None:
+    app.include_router(voice_router)
+app.include_router(face_router)
+app.include_router(meeting_router)
+app.include_router(billing_router)
+app.include_router(rag_router)
+app.include_router(persona_router)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
@@ -502,16 +739,6 @@ class SummaryRequest(BaseModel):
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "whisper": HAS_WHISPER,
-        "rag": HAS_RAG,
-        "llm": HAS_LLM,
-        "rag_chunks": rag.collection.count() if HAS_RAG and rag.collection else 0,
-    }
-
 @app.post("/meeting/start")
 async def start_meeting(req: MeetingStartRequest):
     with state.lock:
@@ -531,6 +758,15 @@ async def end_meeting():
         state.active = False
         duration = int(time.time() - state.start_time)
     return {"status": "ended", "duration_seconds": duration}
+
+
+@app.post("/meeting/{meeting_id}/end")
+async def end_meeting_by_id(meeting_id: str):
+    """Alias endpoint — ID-scoped end, for frontend backward compat."""
+    with state.lock:
+        state.active = False
+        duration = int(time.time() - state.start_time)
+    return {"status": "ended", "meeting_id": meeting_id, "duration_seconds": duration}
 
 @app.get("/transcript/live")
 async def get_transcript():
@@ -579,14 +815,27 @@ async def ask_question(req: AskRequest):
     return {"suggestions": suggestions}
 
 @app.get("/meeting/suggest/stream")
-async def stream_suggestion(question: str, model: Optional[str] = None):
+async def stream_suggestion_suggest(question: Optional[str] = None, q: Optional[str] = None, model: Optional[str] = None):
+    """SSE streaming endpoint. Accepts both ?question= and ?q= for backward compat."""
+    question = question or q or ""
+    return await stream_suggestion(question=question, model=model)
+
+
+@app.get("/meeting/stream")
+async def stream_suggestion(question: Optional[str] = None, q: Optional[str] = None, model: Optional[str] = None):
     """SSE streaming endpoint for real-time suggestion generation."""
+    question = question or q or ""
     if not HAS_LLM:
         async def fallback():
             yield "data: {\"done\": true, \"text\": \"LLM not configured\"}\n\n"
         return StreamingResponse(fallback(), media_type="text/event-stream")
 
-    rag_context = "\n---\n".join(rag.query(question)) or "No context."
+    if rag_module._store is not None:
+        rag_results = rag_module._store.query(text=question, n_results=3)
+        rag_chunks = [item.get("text", "") for item in rag_results if isinstance(item, dict)]
+    else:
+        rag_chunks = rag.query(question)
+    rag_context = "\n---\n".join(rag_chunks) or "No context."
     with state.lock:
         transcript = " | ".join(f"{t['speaker']}: {t['text']}" for t in state.transcript[-4:])
         ctx = state.context_prompt
@@ -647,34 +896,6 @@ def _mock_summary(transcript: str) -> str:
 - API Gateway pattern selected for service mesh
 - OpenTelemetry + Jaeger for distributed tracing"""
 
-@app.post("/rag/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Index a document into ChromaDB via the RAG pipeline."""
-    if not HAS_RAG:
-        raise HTTPException(503, "RAG pipeline not available — install chromadb and sentence-transformers")
-    content = await file.read()
-    text = ""
-    fname = file.filename or "upload"
-    try:
-        if fname.endswith(".pdf"):
-            from pypdf import PdfReader
-            import io
-            reader = PdfReader(io.BytesIO(content))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        elif fname.endswith(".docx"):
-            import docx2txt, io
-            text = docx2txt.process(io.BytesIO(content))
-        else:
-            text = content.decode("utf-8", errors="replace")
-    except Exception as e:
-        raise HTTPException(422, f"Failed to parse document: {e}")
-    chunks = rag.add_document(text, source=fname)
-    return {"status": "indexed", "filename": fname, "chunks": chunks}
-
-@app.get("/rag/query")
-async def query_rag(q: str, n: int = 3):
-    results = rag.query(q, n_results=n)
-    return {"query": q, "results": results}
 
 @app.get("/meeting/export")
 async def export_notes(format: str = "md"):
@@ -824,4 +1045,3 @@ def _current_time() -> str:
 
 if __name__ == "__main__":
     uvicorn.run("backend.server:app", host="127.0.0.1", port=8765, reload=True, log_level="info")
-

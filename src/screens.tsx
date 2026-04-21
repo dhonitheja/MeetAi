@@ -6,6 +6,7 @@ import {
 import {
   getHealth, startMeeting, endMeeting, askQuestion, streamSuggestion,
   addTranscriptLine, getLiveTranscript, summarizeMeeting, uploadDocument, exportNotes,
+  listVoiceProfiles, uploadVoiceProfile, synthesizeVoice, type VoiceProfile,
 } from './api';
 import type { HealthStatus, Suggestion as APISuggestion } from './api';
 
@@ -255,9 +256,70 @@ export function SetupScreen({ setScreen }: SetupScreenProps) {
         </div>
       </div>
 
+      <VoiceSection />
+
       <button className="btn-primary" style={{ marginTop: 24 }} onClick={() => setScreen('meeting')}>
         Start Meeting →
       </button>
+    </div>
+  );
+}
+
+function VoiceSection() {
+  const [profiles, setProfiles] = useState<VoiceProfile[]>([]);
+  const [activeProfile, setActiveProfile] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    listVoiceProfiles().then(setProfiles);
+    const stored = localStorage.getItem('meetai_voice_id');
+    if (stored) setActiveProfile(stored);
+  }, []);
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    const name = window.prompt("Name this persona (e.g. 'Standard', 'Deep', 'Professional'):", "My Voice") || "New Voice";
+    const res = await uploadVoiceProfile(name, file);
+    if (res) {
+      setProfiles(prev => [...prev, res]);
+      setActiveProfile(res.id);
+      localStorage.setItem('meetai_voice_id', res.id);
+    }
+    setUploading(false);
+  };
+
+  const select = (id: string) => {
+    setActiveProfile(id);
+    localStorage.setItem('meetai_voice_id', id);
+  };
+
+  return (
+    <div style={{ marginTop: 28 }}>
+      <div className="section-label">Personas & Local Voice Cloning</div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+        VoxCPM2 (Local 2B) · Encrypted Biometrics · Real-time 48kHz
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: 10, marginBottom: 12 }}>
+        {profiles.map(p => (
+          <div key={p.id} onClick={() => select(p.id)} className={`glass-card interactive ${activeProfile === p.id ? 'active' : ''}`}
+            style={{ padding: '12px', textAlign: 'center', borderColor: activeProfile === p.id ? 'var(--primary)' : undefined }}>
+            <div style={{ fontSize: 20, marginBottom: 4 }}>👤</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#fff' }}>{p.name}</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{new Date(p.created_at).toLocaleDateString()}</div>
+          </div>
+        ))}
+        <div onClick={() => !uploading && fileRef.current?.click()} className="glass-card interactive"
+           style={{ padding: '12px', textAlign: 'center', borderStyle: 'dashed', borderColor: 'var(--bd)' }}>
+          <input ref={fileRef} type="file" accept="audio/*" style={{ display: 'none' }} onChange={handleUpload} />
+          <div style={{ fontSize: 20, marginBottom: 4 }}>{uploading ? '⏳' : '+'}</div>
+          <div style={{ fontSize: 12, color: 'var(--primary)' }}>{uploading ? 'Cloning…' : 'Clone Voice'}</div>
+          <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 2 }}>10s reference WAV</div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -546,6 +608,15 @@ function SuggestionCard({ suggestion, isOpen, onToggle, onCopy }: {
   onToggle: () => void;
   onCopy: (text: string) => void;
 }) {
+  const [speaking, setSpeaking] = useState(false);
+  const handleSpeak = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const vid = localStorage.getItem('meetai_voice_id');
+    if (!vid) { alert("Please set up a Voice Persona first."); return; }
+    setSpeaking(true);
+    await synthesizeVoice(suggestion.text, vid);
+    setSpeaking(false);
+  };
   return (
     <div className="glass-card" onClick={onToggle} style={{ padding: '12px 13px', marginBottom: 8, cursor: 'pointer', borderColor: isOpen ? 'rgba(99,102,241,0.35)' : undefined, background: isOpen ? 'rgba(99,102,241,0.05)' : undefined, transition: 'all 0.2s' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -559,9 +630,14 @@ function SuggestionCard({ suggestion, isOpen, onToggle, onCopy }: {
           <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.65, marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--outline-variant)' }}>
             {suggestion.text}
           </div>
-          <button className="btn-ghost" style={{ marginTop: 10, fontSize: 12 }} onClick={(e) => { e.stopPropagation(); onCopy(suggestion.text); }}>
-            Copy ↗
-          </button>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn-ghost" style={{ marginTop: 10, fontSize: 12, flex: 1 }} onClick={(e) => { e.stopPropagation(); onCopy(suggestion.text); }}>
+              Copy ↗
+            </button>
+            <button className="btn-primary" style={{ marginTop: 10, fontSize: 12, flex: 1, height: 32, background: speaking ? 'var(--live)' : undefined }} onClick={handleSpeak}>
+              {speaking ? '🔊 Speaking…' : '🎙️ Speak Persona'}
+            </button>
+          </div>
         </>
       )}
     </div>
